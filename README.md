@@ -50,25 +50,28 @@ The assignment is small on purpose. We want correct, safe, and clear code. We do
 
 ### 2. Core Data Flow & Algorithms
 
-* **Deterministic Remainder Splitting:**
+- **Deterministic Remainder Splitting:**
   When a bill of `totalCents` is split across $N$ members:
   $$\text{baseShare} = \lfloor \text{totalCents} / N \rfloor, \quad \text{remainder} = \text{totalCents} \pmod N$$
   Members are ordered by addition sequence (`ORDER BY rowid ASC`). The first `remainder` members receive $\text{baseShare} + 1$, and subsequent members receive $\text{baseShare}$.
-  *Example:* 1000 cents split between 3 members yields `[334, 333, 333]` cents. The shares always strictly sum to `totalCents`.
+  _Example:_ 1000 cents split between 3 members yields `[334, 333, 333]` cents. The shares always strictly sum to `totalCents`.
 
-* **Concurrency-Safe Idempotent Payments:**
+- **Concurrency-Safe Idempotent Payments:**
   Share payments require an `Idempotency-Key` header. Concurrency control uses an atomic conditional update:
+
   ```sql
-  UPDATE shares 
-  SET paid_at = ?, idempotency_key = ? 
+  UPDATE shares
+  SET paid_at = ?, idempotency_key = ?
   WHERE id = ? AND bill_id = ? AND paid_at IS NULL
   ```
+
   - **First attempt:** Matches the unpaid share, updates `changes === 1`, and returns `200 OK`.
   - **Duplicate attempt (same key):** Detects existing payment with matching key and idempotently returns `200 OK` with original `paidAt`.
   - **Concurrent attempt (different key):** Fails conditional update (`changes === 0`) or triggers unique constraint `uq_shares_idempotency_key`, returning `409 Conflict`.
 
-* **Correlated Balance Aggregation:**
+- **Correlated Balance Aggregation:**
   `GET /api/homes/:homeId/balances` calculates the sum of all unpaid shares for every member across all home bills:
+
   ```sql
   SELECT m.id AS memberId, m.name,
     COALESCE((
@@ -79,35 +82,36 @@ The assignment is small on purpose. We want correct, safe, and clear code. We do
     ), 0) AS outstandingCents
   FROM members m WHERE m.home_id = ? ORDER BY m.rowid ASC;
   ```
+
   Isolates aggregation per member, guaranteeing housemates with zero debt report `0` cents without outer-join duplication risks.
 
 ---
 
 ### 3. Database Schema & Named Constraints
 
-| Constraint Name | Type | Table | Purpose |
-| :--- | :---: | :--- | :--- |
-| `fk_members_home` | Foreign Key | `members` | Prevents orphan members; cascades home deletion. |
-| `chk_bills_total_positive` | CHECK | `bills` | Ensures `total_cents > 0`, blocking zero/negative bills. |
-| `fk_bills_home` | Foreign Key | `bills` | Prevents orphan bills; cascades home deletion. |
-| `chk_shares_amount_positive` | CHECK | `shares` | Ensures `amount_cents > 0`, preventing invalid share amounts. |
-| `uq_shares_idempotency_key` | UNIQUE | `shares` | Prevents duplicate payments with different keys. |
-| `fk_shares_bill` | Foreign Key | `shares` | Enforces share association to existing bills. |
-| `fk_shares_member` | Foreign Key | `shares` | Enforces share association to existing members. |
+| Constraint Name              |    Type     | Table     | Purpose                                                       |
+| :--------------------------- | :---------: | :-------- | :------------------------------------------------------------ |
+| `fk_members_home`            | Foreign Key | `members` | Prevents orphan members; cascades home deletion.              |
+| `chk_bills_total_positive`   |    CHECK    | `bills`   | Ensures `total_cents > 0`, blocking zero/negative bills.      |
+| `fk_bills_home`              | Foreign Key | `bills`   | Prevents orphan bills; cascades home deletion.                |
+| `chk_shares_amount_positive` |    CHECK    | `shares`  | Ensures `amount_cents > 0`, preventing invalid share amounts. |
+| `uq_shares_idempotency_key`  |   UNIQUE    | `shares`  | Prevents duplicate payments with different keys.              |
+| `fk_shares_bill`             | Foreign Key | `shares`  | Enforces share association to existing bills.                 |
+| `fk_shares_member`           | Foreign Key | `shares`  | Enforces share association to existing members.               |
 
 ---
 
 ### 4. Edge Cases Handled
 
-| Case | Scenario | Handling & Response |
-| :---: | :--- | :--- |
-| **1** | Home with no members | Returns `422 Unprocessable Entity`; UI disables bill creation and presents a clear guide warning. |
-| **2** | Amount $\le 0$ or non-integer | Returns `422 Unprocessable Entity`; UI prevents decimal inputs and validates positive amounts. |
-| **3** | Uneven split amounts | Remainder cents distributed deterministically to first members in addition order (`rowid ASC`). |
-| **4** | Duplicate payment request | Identical `Idempotency-Key` returns original payment record with `200 OK` without double-charging. |
-| **5** | Concurrent payments on same share | Atomic conditional SQL update ensures only 1 request succeeds; conflicting request receives `409 Conflict`. |
-| **6** | Bill or share does not exist | Returns `404 Not Found` with `{ "error": "Bill not found" }` or `{ "error": "Share not found" }`. |
-| **7** | Slow API or 500 error | UI catches errors gracefully, displays dismissible alerts with a retry action, and preserves unpaid share state. |
+| Case  | Scenario                          | Handling & Response                                                                                              |
+| :---: | :-------------------------------- | :--------------------------------------------------------------------------------------------------------------- |
+| **1** | Home with no members              | Returns `422 Unprocessable Entity`; UI disables bill creation and presents a clear guide warning.                |
+| **2** | Amount $\le 0$ or non-integer     | Returns `422 Unprocessable Entity`; UI prevents decimal inputs and validates positive amounts.                   |
+| **3** | Uneven split amounts              | Remainder cents distributed deterministically to first members in addition order (`rowid ASC`).                  |
+| **4** | Duplicate payment request         | Identical `Idempotency-Key` returns original payment record with `200 OK` without double-charging.               |
+| **5** | Concurrent payments on same share | Atomic conditional SQL update ensures only 1 request succeeds; conflicting request receives `409 Conflict`.      |
+| **6** | Bill or share does not exist      | Returns `404 Not Found` with `{ "error": "Bill not found" }` or `{ "error": "Share not found" }`.                |
+| **7** | Slow API or 500 error             | UI catches errors gracefully, displays dismissible alerts with a retry action, and preserves unpaid share state. |
 
 ---
 
