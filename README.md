@@ -124,6 +124,47 @@ The assignment is small on purpose. We want correct, safe, and clear code. We do
 
 Take your time. A careful, correct solution is better than a fast one. We expect 2 to 3 days of real work.
 
+## Decisions
+
+> [!IMPORTANT]
+> Below are the 3 core engineering decisions and architectural trade-offs made in this project:
+
+### 1. Defensive Database Constraints for Financial Integrity
+
+- **What:** Enforced financial and referential integrity directly at the SQLite D1 layer using named constraints: `fk_members_home`, `chk_bills_total_positive`, `chk_shares_amount_positive`, `uq_shares_idempotency_key`, `fk_bills_home`, `fk_shares_bill`, and `fk_shares_member`.
+- **Why & Trade-off:** While payload checks exist in Hono route handlers, application-level validation can be bypassed by concurrent race conditions or future refactors. Placing constraints at the database engine level ensures that corrupt financial records, zero/negative balances, or orphaned splits are physically impossible to persist.
+
+### 2. Atomic Concurrency Control & Idempotency for Payments
+
+- **What:** Concurrency safety and idempotency are handled through an atomic conditional update:
+
+  ```sql
+  UPDATE shares
+  SET paid_at = ?, idempotency_key = ?
+  WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+  ```
+
+  paired with a unique constraint on `idempotency_key`.
+- **Why & Trade-off:** We avoided external distributed locks, which introduce latency, failure modes, and deadlock risks. When two simultaneous payment requests arrive for the same share, the database engine executes the update atomically: exactly one request succeeds (`changes === 1`), while the concurrent request fails and returns `409 Conflict`. Re-transmitting the identical `Idempotency-Key` detects the existing payment and idempotently returns `200 OK` with the original timestamp.
+
+### 3. Deterministic Member-Order Splitting & Correlated Balance Aggregation
+
+- **What:** Remainder cents from uneven splits are distributed to members strictly in their sequence of joining (`ORDER BY rowid ASC`). For balance reporting, individual debts are computed via correlated scalar subqueries:
+
+  ```sql
+  SELECT m.id AS memberId, m.name,
+    COALESCE((
+      SELECT SUM(s.amount_cents)
+      FROM shares s
+      JOIN bills b ON s.bill_id = b.id
+      WHERE s.member_id = m.id AND b.home_id = m.home_id AND s.paid_at IS NULL
+    ), 0) AS outstandingCents
+  FROM members m WHERE m.home_id = ? ORDER BY m.rowid ASC;
+  ```
+- **Why & Trade-off:** Multi-table `LEFT JOIN` queries with `GROUP BY` across homes, members, bills, and shares create Cartesian duplicate risks and fragile aggregation when homes have multiple bills with partial payments. A correlated subquery isolates the calculation per member, guarantees predictable performance, and cleanly represents members who owe `0` cents.
+
+---
+
 ## Stack (required)
 
 - **API:** Hono on Cloudflare Workers
@@ -253,45 +294,6 @@ pnpm --filter bill-splitter-api cf-typegen
 
 You can use AI tools. Tell us which ones and where in your answers on the form.
 You must understand every line you submit. We check this with your video and in a live call. "The AI wrote it" is not an answer.
-
-## Decisions
-
-> [!IMPORTANT]
-> Below are the 3 core engineering decisions and architectural trade-offs made in this project:
-
-### 1. Defensive Database Constraints for Financial Integrity
-
-- **What:** Enforced financial and referential integrity directly at the SQLite D1 layer using named constraints: `fk_members_home`, `chk_bills_total_positive`, `chk_shares_amount_positive`, `uq_shares_idempotency_key`, `fk_bills_home`, `fk_shares_bill`, and `fk_shares_member`.
-- **Why & Trade-off:** While payload checks exist in Hono route handlers, application-level validation can be bypassed by concurrent race conditions or future refactors. Placing constraints at the database engine level ensures that corrupt financial records, zero/negative balances, or orphaned splits are physically impossible to persist.
-
-### 2. Atomic Concurrency Control & Idempotency for Payments
-
-- **What:** Concurrency safety and idempotency are handled through an atomic conditional update:
-
-  ```sql
-  UPDATE shares
-  SET paid_at = ?, idempotency_key = ?
-  WHERE id = ? AND bill_id = ? AND paid_at IS NULL
-  ```
-
-  paired with a unique constraint on `idempotency_key`.
-- **Why & Trade-off:** We avoided external distributed locks, which introduce latency, failure modes, and deadlock risks. When two simultaneous payment requests arrive for the same share, the database engine executes the update atomically: exactly one request succeeds (`changes === 1`), while the concurrent request fails and returns `409 Conflict`. Re-transmitting the identical `Idempotency-Key` detects the existing payment and idempotently returns `200 OK` with the original timestamp.
-
-### 3. Deterministic Member-Order Splitting & Correlated Balance Aggregation
-
-- **What:** Remainder cents from uneven splits are distributed to members strictly in their sequence of joining (`ORDER BY rowid ASC`). For balance reporting, individual debts are computed via correlated scalar subqueries:
-
-  ```sql
-  SELECT m.id AS memberId, m.name,
-    COALESCE((
-      SELECT SUM(s.amount_cents)
-      FROM shares s
-      JOIN bills b ON s.bill_id = b.id
-      WHERE s.member_id = m.id AND b.home_id = m.home_id AND s.paid_at IS NULL
-    ), 0) AS outstandingCents
-  FROM members m WHERE m.home_id = ? ORDER BY m.rowid ASC;
-  ```
-- **Why & Trade-off:** Multi-table `LEFT JOIN` queries with `GROUP BY` across homes, members, bills, and shares create Cartesian duplicate risks and fragile aggregation when homes have multiple bills with partial payments. A correlated subquery isolates the calculation per member, guarantees predictable performance, and cleanly represents members who owe `0` cents.
 
 ---
 
